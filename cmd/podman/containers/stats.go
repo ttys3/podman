@@ -56,9 +56,7 @@ type statsOptionsCLI struct {
 	Interval int
 }
 
-var (
-	statsOptions statsOptionsCLI
-)
+var statsOptions statsOptionsCLI
 
 func statFlags(cmd *cobra.Command) {
 	flags := cmd.Flags()
@@ -166,7 +164,7 @@ func outputStats(cmd *cobra.Command, reports []define.ContainerStats) error {
 	if cmd.Flags().Changed("format") {
 		rpt, err = rpt.Parse(report.OriginUser, statsOptions.Format)
 	} else {
-		format := "{{range .}}{{.ID}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDS}}\t{{.UpTime}}\t{{.AVGCPU}}\n{{end -}}"
+		format := "{{range .}}{{.ID}}\t{{.Name}}\t{{.CPUPerc}}\t{{.MemUsageBytes}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDS}}\t{{.UpTime}}\t{{.AVGCPU}}\n{{end -}}"
 		rpt, err = rpt.Parse(report.OriginPodman, format)
 	}
 	if err != nil {
@@ -206,11 +204,11 @@ func (s *containerStats) MemPerc() string {
 }
 
 func (s *containerStats) NetIO() string {
-	return combineHumanValues(s.NetInput, s.NetOutput)
+	return combineBytesValues(s.NetInput, s.NetOutput)
 }
 
 func (s *containerStats) BlockIO() string {
-	return combineHumanValues(s.BlockInput, s.BlockOutput)
+	return combineBytesValues(s.BlockInput, s.BlockOutput)
 }
 
 func (s *containerStats) PIDS() string {
@@ -273,7 +271,7 @@ func outputJSON(stats []containerStats) error {
 			CPUTime:    j.Up(),
 			CpuPercent: j.CPUPerc(),
 			AverageCPU: j.AVGCPU(),
-			MemUsage:   j.MemUsage(),
+			MemUsage:   j.MemUsageBytes(),
 			MemPerc:    j.MemPerc(),
 			NetIO:      j.NetIO(),
 			BlockIO:    j.BlockIO(),
