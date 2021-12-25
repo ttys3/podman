@@ -7,8 +7,7 @@ import (
 	spec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-type memHandler struct {
-}
+type memHandler struct{}
 
 func getMemoryHandler() *memHandler {
 	return &memHandler{}
@@ -45,16 +44,25 @@ func (c *memHandler) Stat(ctr *CgroupControl, m *Metrics) error {
 
 	if ctr.cgroup2 {
 		memoryRoot = filepath.Join(cgroupRoot, ctr.path)
-		filenames["usage"] = "memory.current"
+		filenames["usage"] = "memory.stat"
 		filenames["limit"] = "memory.max"
 	} else {
 		memoryRoot = ctr.getCgroupv1Path(Memory)
 		filenames["usage"] = "memory.usage_in_bytes"
 		filenames["limit"] = "memory.limit_in_bytes"
 	}
-	usage.Usage, err = readFileAsUint64(filepath.Join(memoryRoot, filenames["usage"]))
-	if err != nil {
-		return err
+
+	if filenames["usage"] == "memory.stat" {
+		anon, err := readFileByKeyAsUint64(filepath.Join(memoryRoot, filenames["usage"]), "anon")
+		if err != nil {
+			return err
+		}
+		usage.Usage = anon
+	} else {
+		usage.Usage, err = readFileAsUint64(filepath.Join(memoryRoot, filenames["usage"]))
+		if err != nil {
+			return err
+		}
 	}
 	usage.Limit, err = readFileAsUint64(filepath.Join(memoryRoot, filenames["limit"]))
 	if err != nil {
