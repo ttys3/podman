@@ -14,7 +14,7 @@ require (
 	github.com/containers/buildah v1.24.1
 	github.com/containers/common v0.47.3
 	github.com/containers/conmon v2.0.20+incompatible
-	github.com/containers/image/v5 v5.19.1
+	github.com/containers/image/v5 v5.20.0
 	github.com/containers/ocicrypt v1.1.2
 	github.com/containers/psgo v1.7.2
 	github.com/containers/storage v1.38.2
@@ -23,7 +23,7 @@ require (
 	github.com/cyphar/filepath-securejoin v0.2.3
 	github.com/davecgh/go-spew v1.1.1
 	github.com/digitalocean/go-qemu v0.0.0-20210326154740-ac9e0b687001
-	github.com/docker/distribution v2.7.1+incompatible
+	github.com/docker/distribution v2.8.0+incompatible
 	github.com/docker/docker v20.10.12+incompatible
 	github.com/docker/go-connections v0.4.1-0.20210727194412-58542c764a11
 	github.com/docker/go-plugins-helpers v0.0.0-20211224144127-6eecb7beb651
@@ -66,7 +66,7 @@ require (
 	go.etcd.io/bbolt v1.3.6
 	golang.org/x/crypto v0.0.0-20220112180741-5e0467b6c7ce
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20220114195835-da31bd327af9
+	golang.org/x/sys v0.0.0-20220128215802-99c3d69c2c27
 	golang.org/x/text v0.3.7
 	google.golang.org/protobuf v1.27.1
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
