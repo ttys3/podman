@@ -1,10 +1,12 @@
-// +build linux
+//go:build linux || freebsd
+// +build linux freebsd
 
 package netavark
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,9 +14,9 @@ import (
 
 	"github.com/containers/common/libnetwork/internal/util"
 	"github.com/containers/common/libnetwork/types"
+	"github.com/containers/common/pkg/config"
 	"github.com/containers/storage/pkg/lockfile"
 	"github.com/containers/storage/pkg/unshare"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -25,7 +27,7 @@ type netavarkNetwork struct {
 	// networkRunDir is where temporary files are stored, i.e.the ipam db, aardvark config etc
 	networkRunDir string
 
-	// tells netavark whether this is rootless mode or rootfull, "true" or "false"
+	// tells netavark whether this is rootless mode or rootful, "true" or "false"
 	networkRootless bool
 
 	// netavarkBinary is the path to the netavark binary.
@@ -37,6 +39,12 @@ type netavarkNetwork struct {
 	defaultNetwork string
 	// defaultSubnet is the default subnet for the default network.
 	defaultSubnet types.IPNet
+
+	// defaultsubnetPools contains the subnets which must be used to allocate a free subnet by network create
+	defaultsubnetPools []config.SubnetPool
+
+	// dnsBindPort is set the the port to pass to netavark for aardvark
+	dnsBindPort uint16
 
 	// ipamDBPath is the path to the ip allocation bolt db
 	ipamDBPath string
@@ -72,6 +80,12 @@ type InitConfig struct {
 	// DefaultSubnet is the default subnet for the default network.
 	DefaultSubnet string
 
+	// DefaultsubnetPools contains the subnets which must be used to allocate a free subnet by network create
+	DefaultsubnetPools []config.SubnetPool
+
+	// DNSBindPort is set the the port to pass to netavark for aardvark
+	DNSBindPort uint16
+
 	// Syslog describes whenever the netavark debbug output should be log to the syslog as well.
 	// This will use logrus to do so, make sure logrus is set up to log to the syslog.
 	Syslog bool
@@ -80,8 +94,13 @@ type InitConfig struct {
 // NewNetworkInterface creates the ContainerNetwork interface for the netavark backend.
 // Note: The networks are not loaded from disk until a method is called.
 func NewNetworkInterface(conf *InitConfig) (types.ContainerNetwork, error) {
-	// TODO: consider using a shared memory lock
-	lock, err := lockfile.GetLockfile(filepath.Join(conf.NetworkConfigDir, "netavark.lock"))
+	// root needs to use a globally unique lock because there is only one host netns
+	lockPath := defaultRootLockPath
+	if unshare.IsRootless() {
+		lockPath = filepath.Join(conf.NetworkConfigDir, "netavark.lock")
+	}
+
+	lock, err := lockfile.GetLockFile(lockPath)
 	if err != nil {
 		return nil, err
 	}
@@ -97,28 +116,35 @@ func NewNetworkInterface(conf *InitConfig) (types.ContainerNetwork, error) {
 	}
 	defaultNet, err := types.ParseCIDR(defaultSubnet)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse default subnet")
+		return nil, fmt.Errorf("failed to parse default subnet: %w", err)
 	}
 
-	if err := os.MkdirAll(conf.NetworkConfigDir, 0755); err != nil {
+	if err := os.MkdirAll(conf.NetworkConfigDir, 0o755); err != nil {
 		return nil, err
 	}
 
-	if err := os.MkdirAll(conf.NetworkRunDir, 0755); err != nil {
+	if err := os.MkdirAll(conf.NetworkRunDir, 0o755); err != nil {
 		return nil, err
+	}
+
+	defaultSubnetPools := conf.DefaultsubnetPools
+	if defaultSubnetPools == nil {
+		defaultSubnetPools = config.DefaultSubnetPools
 	}
 
 	n := &netavarkNetwork{
-		networkConfigDir: conf.NetworkConfigDir,
-		networkRunDir:    conf.NetworkRunDir,
-		netavarkBinary:   conf.NetavarkBinary,
-		aardvarkBinary:   conf.AardvarkBinary,
-		networkRootless:  unshare.IsRootless(),
-		ipamDBPath:       filepath.Join(conf.NetworkRunDir, "ipam.db"),
-		defaultNetwork:   defaultNetworkName,
-		defaultSubnet:    defaultNet,
-		lock:             lock,
-		syslog:           conf.Syslog,
+		networkConfigDir:   conf.NetworkConfigDir,
+		networkRunDir:      conf.NetworkRunDir,
+		netavarkBinary:     conf.NetavarkBinary,
+		aardvarkBinary:     conf.AardvarkBinary,
+		networkRootless:    unshare.IsRootless(),
+		ipamDBPath:         filepath.Join(conf.NetworkRunDir, "ipam.db"),
+		defaultNetwork:     defaultNetworkName,
+		defaultSubnet:      defaultNet,
+		defaultsubnetPools: defaultSubnetPools,
+		dnsBindPort:        conf.DNSBindPort,
+		lock:               lock,
+		syslog:             conf.Syslog,
 	}
 
 	return n, nil
@@ -152,7 +178,7 @@ func (n *netavarkNetwork) loadNetworks() error {
 	n.networks = nil
 	n.modTime = modTime
 
-	files, err := ioutil.ReadDir(n.networkConfigDir)
+	files, err := os.ReadDir(n.networkConfigDir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -207,7 +233,7 @@ func (n *netavarkNetwork) loadNetworks() error {
 	if networks[n.defaultNetwork] == nil {
 		networkInfo, err := n.createDefaultNetwork()
 		if err != nil {
-			return errors.Wrapf(err, "failed to create default network %s", n.defaultNetwork)
+			return fmt.Errorf("failed to create default network %s: %w", n.defaultNetwork, err)
 		}
 		networks[n.defaultNetwork] = networkInfo
 	}
@@ -228,10 +254,12 @@ func parseNetwork(network *types.Network) error {
 	}
 
 	if len(network.ID) != 64 {
-		return errors.Errorf("invalid network ID %q", network.ID)
+		return fmt.Errorf("invalid network ID %q", network.ID)
 	}
 
-	return util.ValidateSubnets(network, nil)
+	// add gateway when not internal or dns enabled
+	addGateway := !network.Internal || network.DNSEnabled
+	return util.ValidateSubnets(network, addGateway, nil)
 }
 
 func (n *netavarkNetwork) createDefaultNetwork() (*types.Network, error) {
@@ -268,7 +296,7 @@ func (n *netavarkNetwork) getNetwork(nameOrID string) (*types.Network, error) {
 
 		if strings.HasPrefix(val.ID, nameOrID) {
 			if net != nil {
-				return nil, errors.Errorf("more than one result for network ID %s", nameOrID)
+				return nil, fmt.Errorf("more than one result for network ID %s", nameOrID)
 			}
 			net = val
 		}
@@ -276,7 +304,7 @@ func (n *netavarkNetwork) getNetwork(nameOrID string) (*types.Network, error) {
 	if net != nil {
 		return net, nil
 	}
-	return nil, errors.Wrapf(types.ErrNoSuchNetwork, "unable to find network with name or ID %s", nameOrID)
+	return nil, fmt.Errorf("unable to find network with name or ID %s: %w", nameOrID, types.ErrNoSuchNetwork)
 }
 
 // Implement the NetUtil interface for easy code sharing with other network interfaces.

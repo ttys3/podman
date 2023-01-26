@@ -17,6 +17,9 @@
 package cdi
 
 import (
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -78,12 +81,46 @@ func (e *ContainerEdits) Apply(spec *oci.Spec) error {
 	if len(e.Env) > 0 {
 		specgen.AddMultipleProcessEnv(e.Env)
 	}
+
 	for _, d := range e.DeviceNodes {
-		specgen.AddDevice(d.ToOCI())
+		dn := DeviceNode{d}
+
+		err := dn.fillMissingInfo()
+		if err != nil {
+			return err
+		}
+		dev := d.ToOCI()
+		if dev.UID == nil && spec.Process != nil {
+			if uid := spec.Process.User.UID; uid > 0 {
+				dev.UID = &uid
+			}
+		}
+		if dev.GID == nil && spec.Process != nil {
+			if gid := spec.Process.User.GID; gid > 0 {
+				dev.GID = &gid
+			}
+		}
+
+		specgen.RemoveDevice(dev.Path)
+		specgen.AddDevice(dev)
+
+		if dev.Type == "b" || dev.Type == "c" {
+			access := d.Permissions
+			if access == "" {
+				access = "rwm"
+			}
+			specgen.AddLinuxResourcesDevice(true, dev.Type, &dev.Major, &dev.Minor, access)
+		}
 	}
-	for _, m := range e.Mounts {
-		specgen.AddMount(m.ToOCI())
+
+	if len(e.Mounts) > 0 {
+		for _, m := range e.Mounts {
+			specgen.RemoveMount(m.ContainerPath)
+			specgen.AddMount(m.ToOCI())
+		}
+		sortMounts(&specgen)
 	}
+
 	for _, h := range e.Hooks {
 		switch h.HookName {
 		case PrestartHook:
@@ -138,6 +175,27 @@ func (e *ContainerEdits) Validate() error {
 	return nil
 }
 
+// Append other edits into this one. If called with a nil receiver,
+// allocates and returns newly allocated edits.
+func (e *ContainerEdits) Append(o *ContainerEdits) *ContainerEdits {
+	if o == nil || o.ContainerEdits == nil {
+		return e
+	}
+	if e == nil {
+		e = &ContainerEdits{}
+	}
+	if e.ContainerEdits == nil {
+		e.ContainerEdits = &specs.ContainerEdits{}
+	}
+
+	e.Env = append(e.Env, o.Env...)
+	e.DeviceNodes = append(e.DeviceNodes, o.DeviceNodes...)
+	e.Hooks = append(e.Hooks, o.Hooks...)
+	e.Mounts = append(e.Mounts, o.Mounts...)
+
+	return e
+}
+
 // isEmpty returns true if these edits are empty. This is valid in a
 // global Spec context but invalid in a Device context.
 func (e *ContainerEdits) isEmpty() bool {
@@ -164,10 +222,18 @@ type DeviceNode struct {
 
 // Validate a CDI Spec DeviceNode.
 func (d *DeviceNode) Validate() error {
+	validTypes := map[string]struct{}{
+		"":  {},
+		"b": {},
+		"c": {},
+		"u": {},
+		"p": {},
+	}
+
 	if d.Path == "" {
 		return errors.New("invalid (empty) device path")
 	}
-	if d.Type != "" && d.Type != "b" && d.Type != "c" {
+	if _, ok := validTypes[d.Type]; !ok {
 		return errors.Errorf("device %q: invalid type %q", d.Path, d.Type)
 	}
 	for _, bit := range d.Permissions {
@@ -219,4 +285,47 @@ func ensureOCIHooks(spec *oci.Spec) {
 	if spec.Hooks == nil {
 		spec.Hooks = &oci.Hooks{}
 	}
+}
+
+// sortMounts sorts the mounts in the given OCI Spec.
+func sortMounts(specgen *ocigen.Generator) {
+	mounts := specgen.Mounts()
+	specgen.ClearMounts()
+	sort.Sort(orderedMounts(mounts))
+	specgen.Config.Mounts = mounts
+}
+
+// orderedMounts defines how to sort an OCI Spec Mount slice.
+// This is the almost the same implementation sa used by CRI-O and Docker,
+// with a minor tweak for stable sorting order (easier to test):
+//   https://github.com/moby/moby/blob/17.05.x/daemon/volumes.go#L26
+type orderedMounts []oci.Mount
+
+// Len returns the number of mounts. Used in sorting.
+func (m orderedMounts) Len() int {
+	return len(m)
+}
+
+// Less returns true if the number of parts (a/b/c would be 3 parts) in the
+// mount indexed by parameter 1 is less than that of the mount indexed by
+// parameter 2. Used in sorting.
+func (m orderedMounts) Less(i, j int) bool {
+	ip, jp := m.parts(i), m.parts(j)
+	if ip < jp {
+		return true
+	}
+	if jp < ip {
+		return false
+	}
+	return m[i].Destination < m[j].Destination
+}
+
+// Swap swaps two items in an array of mounts. Used in sorting
+func (m orderedMounts) Swap(i, j int) {
+	m[i], m[j] = m[j], m[i]
+}
+
+// parts returns the number of parts in the destination of a mount. Used in sorting.
+func (m orderedMounts) parts(i int) int {
+	return strings.Count(filepath.Clean(m[i].Destination), string(os.PathSeparator))
 }
