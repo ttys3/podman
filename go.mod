@@ -3,6 +3,7 @@ module github.com/containers/podman/v4
 go 1.16
 
 require (
+	github.com/AdaLogics/go-fuzz-headers v0.0.0-20230811130428-ced1acdcaa24 // indirect
 	github.com/BurntSushi/toml v1.0.0
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/buger/goterm v1.0.4
@@ -24,7 +25,7 @@ require (
 	github.com/davecgh/go-spew v1.1.1
 	github.com/digitalocean/go-qemu v0.0.0-20210326154740-ac9e0b687001
 	github.com/docker/distribution v2.7.1+incompatible
-	github.com/docker/docker v20.10.12+incompatible
+	github.com/docker/docker v24.0.5+incompatible
 	github.com/docker/go-connections v0.4.1-0.20210727194412-58542c764a11
 	github.com/docker/go-plugins-helpers v0.0.0-20211224144127-6eecb7beb651
 	github.com/docker/go-units v0.4.0
@@ -41,6 +42,8 @@ require (
 	github.com/hpcloud/tail v1.0.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mattn/go-isatty v0.0.14
+	github.com/moby/patternmatcher v0.6.0 // indirect
+	github.com/moby/sys/sequential v0.5.0 // indirect
 	github.com/moby/term v0.0.0-20210619224110-3f7ff695adc6
 	github.com/mrunalp/fileutils v0.5.0
 	github.com/onsi/ginkgo v1.16.5
@@ -66,7 +69,7 @@ require (
 	go.etcd.io/bbolt v1.3.6
 	golang.org/x/crypto v0.0.0-20220112180741-5e0467b6c7ce
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20220114195835-da31bd327af9
+	golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a
 	golang.org/x/text v0.3.7
 	google.golang.org/protobuf v1.27.1
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
