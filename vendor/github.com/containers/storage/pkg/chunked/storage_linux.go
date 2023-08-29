@@ -4,10 +4,10 @@ import (
 	archivetar "archive/tar"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -31,7 +31,6 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/klauspost/pgzip"
 	digest "github.com/opencontainers/go-digest"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vbatts/tar-split/archive/tar"
 	"golang.org/x/sys/unix"
@@ -56,6 +55,7 @@ type compressedFileType int
 type chunkedDiffer struct {
 	stream      ImageSourceSeekable
 	manifest    []byte
+	tarSplit    []byte
 	layersCache *layersCache
 	tocOffset   int64
 	fileType    compressedFileType
@@ -65,6 +65,8 @@ type chunkedDiffer struct {
 	gzipReader *pgzip.Reader
 	zstdReader *zstd.Decoder
 	rawReader  io.Reader
+
+	tocDigest digest.Digest
 }
 
 var xattrsToIgnore = map[string]interface{}{
@@ -136,6 +138,26 @@ func copyFileContent(srcFd int, destFile string, dirfd int, mode os.FileMode, us
 	return dstFile, st.Size(), nil
 }
 
+// GetTOCDigest returns the digest of the TOC as recorded in the annotations.
+// This is an experimental feature and may be changed/removed in the future.
+func GetTOCDigest(annotations map[string]string) (*digest.Digest, error) {
+	if tocDigest, ok := annotations[estargz.TOCJSONDigestAnnotation]; ok {
+		d, err := digest.Parse(tocDigest)
+		if err != nil {
+			return nil, err
+		}
+		return &d, nil
+	}
+	if tocDigest, ok := annotations[internal.ManifestChecksumKey]; ok {
+		d, err := digest.Parse(tocDigest)
+		if err != nil {
+			return nil, err
+		}
+		return &d, nil
+	}
+	return nil, nil
+}
+
 // GetDiffer returns a differ than can be used with ApplyDiffWithDiffer.
 func GetDiffer(ctx context.Context, store storage.Store, blobSize int64, annotations map[string]string, iss ImageSourceSeekable) (graphdriver.Differ, error) {
 	if _, ok := annotations[internal.ManifestChecksumKey]; ok {
@@ -148,7 +170,7 @@ func GetDiffer(ctx context.Context, store storage.Store, blobSize int64, annotat
 }
 
 func makeZstdChunkedDiffer(ctx context.Context, store storage.Store, blobSize int64, annotations map[string]string, iss ImageSourceSeekable) (*chunkedDiffer, error) {
-	manifest, tocOffset, err := readZstdChunkedManifest(iss, blobSize, annotations)
+	manifest, tarSplit, tocOffset, err := readZstdChunkedManifest(ctx, iss, blobSize, annotations)
 	if err != nil {
 		return nil, fmt.Errorf("read zstd:chunked manifest: %w", err)
 	}
@@ -157,13 +179,20 @@ func makeZstdChunkedDiffer(ctx context.Context, store storage.Store, blobSize in
 		return nil, err
 	}
 
+	tocDigest, err := digest.Parse(annotations[internal.ManifestChecksumKey])
+	if err != nil {
+		return nil, fmt.Errorf("parse TOC digest %q: %w", annotations[internal.ManifestChecksumKey], err)
+	}
+
 	return &chunkedDiffer{
 		copyBuffer:  makeCopyBuffer(),
-		stream:      iss,
-		manifest:    manifest,
-		layersCache: layersCache,
-		tocOffset:   tocOffset,
 		fileType:    fileTypeZstdChunked,
+		layersCache: layersCache,
+		manifest:    manifest,
+		stream:      iss,
+		tarSplit:    tarSplit,
+		tocOffset:   tocOffset,
+		tocDigest:   tocDigest,
 	}, nil
 }
 
@@ -177,6 +206,11 @@ func makeEstargzChunkedDiffer(ctx context.Context, store storage.Store, blobSize
 		return nil, err
 	}
 
+	tocDigest, err := digest.Parse(annotations[estargz.TOCJSONDigestAnnotation])
+	if err != nil {
+		return nil, fmt.Errorf("parse TOC digest %q: %w", annotations[estargz.TOCJSONDigestAnnotation], err)
+	}
+
 	return &chunkedDiffer{
 		copyBuffer:  makeCopyBuffer(),
 		stream:      iss,
@@ -184,6 +218,7 @@ func makeEstargzChunkedDiffer(ctx context.Context, store storage.Store, blobSize
 		layersCache: layersCache,
 		tocOffset:   tocOffset,
 		fileType:    fileTypeEstargz,
+		tocDigest:   tocDigest,
 	}, nil
 }
 
@@ -272,14 +307,6 @@ func canDedupFileWithHardLink(file *internal.FileMetadata, fd int, s os.FileInfo
 	return canDedupMetadataWithHardLink(file, &otherFile)
 }
 
-func getFileDigest(f *os.File, buf []byte) (digest.Digest, error) {
-	digester := digest.Canonical.Digester()
-	if _, err := io.CopyBuffer(digester.Hash(), f, buf); err != nil {
-		return "", err
-	}
-	return digester.Digest(), nil
-}
-
 // findFileInOSTreeRepos checks whether the requested file already exist in one of the OSTree repo and copies the file content from there if possible.
 // file is the file to look for.
 // ostreeRepos is a list of OSTree repos.
@@ -288,6 +315,7 @@ func getFileDigest(f *os.File, buf []byte) (digest.Digest, error) {
 func findFileInOSTreeRepos(file *internal.FileMetadata, ostreeRepos []string, dirfd int, useHardLinks bool) (bool, *os.File, int64, error) {
 	digest, err := digest.Parse(file.Digest)
 	if err != nil {
+		logrus.Debugf("could not parse digest: %v", err)
 		return false, nil, 0, nil
 	}
 	payloadLink := digest.Encoded() + ".payload-link"
@@ -306,6 +334,7 @@ func findFileInOSTreeRepos(file *internal.FileMetadata, ostreeRepos []string, di
 		}
 		fd, err := unix.Open(sourceFile, unix.O_RDONLY|unix.O_NONBLOCK, 0)
 		if err != nil {
+			logrus.Debugf("could not open sourceFile %s: %v", sourceFile, err)
 			return false, nil, 0, nil
 		}
 		f := os.NewFile(uintptr(fd), "fd")
@@ -318,6 +347,7 @@ func findFileInOSTreeRepos(file *internal.FileMetadata, ostreeRepos []string, di
 
 		dstFile, written, err := copyFileContent(fd, file.Name, dirfd, 0, useHardLinks)
 		if err != nil {
+			logrus.Debugf("could not copyFileContent: %v", err)
 			return false, nil, 0, nil
 		}
 		return true, dstFile, written, nil
@@ -328,75 +358,6 @@ func findFileInOSTreeRepos(file *internal.FileMetadata, ostreeRepos []string, di
 	}
 
 	return false, nil, 0, nil
-}
-
-// findFileOnTheHost checks whether the requested file already exist on the host and copies the file content from there if possible.
-// It is currently implemented to look only at the file with the same path.  Ideally it can detect the same content also at different
-// paths.
-// file is the file to look for.
-// dirfd is an open fd to the destination checkout.
-// useHardLinks defines whether the deduplication can be performed using hard links.
-func findFileOnTheHost(file *internal.FileMetadata, dirfd int, useHardLinks bool, buf []byte) (bool, *os.File, int64, error) {
-	sourceFile := filepath.Clean(filepath.Join("/", file.Name))
-	if !strings.HasPrefix(sourceFile, "/usr/") {
-		// limit host deduplication to files under /usr.
-		return false, nil, 0, nil
-	}
-
-	st, err := os.Stat(sourceFile)
-	if err != nil || !st.Mode().IsRegular() {
-		return false, nil, 0, nil
-	}
-
-	if st.Size() != file.Size {
-		return false, nil, 0, nil
-	}
-
-	fd, err := unix.Open(sourceFile, unix.O_RDONLY|unix.O_NONBLOCK, 0)
-	if err != nil {
-		return false, nil, 0, nil
-	}
-
-	f := os.NewFile(uintptr(fd), "fd")
-	defer f.Close()
-
-	manifestChecksum, err := digest.Parse(file.Digest)
-	if err != nil {
-		return false, nil, 0, err
-	}
-
-	checksum, err := getFileDigest(f, buf)
-	if err != nil {
-		return false, nil, 0, err
-	}
-
-	if checksum != manifestChecksum {
-		return false, nil, 0, nil
-	}
-
-	// check if the open file can be deduplicated with hard links
-	useHardLinks = useHardLinks && canDedupFileWithHardLink(file, fd, st)
-
-	dstFile, written, err := copyFileContent(fd, file.Name, dirfd, 0, useHardLinks)
-	if err != nil {
-		return false, nil, 0, nil
-	}
-
-	// calculate the checksum again to make sure the file wasn't modified while it was copied
-	if _, err := f.Seek(0, 0); err != nil {
-		dstFile.Close()
-		return false, nil, 0, err
-	}
-	checksum, err = getFileDigest(f, buf)
-	if err != nil {
-		dstFile.Close()
-		return false, nil, 0, err
-	}
-	if checksum != manifestChecksum {
-		dstFile.Close()
-		return false, nil, 0, nil
-	}
-	return true, dstFile, written, nil
 }
 
 // findFileInOtherLayers finds the specified file in other layers.
@@ -436,6 +397,24 @@ func maybeDoIDRemap(manifest []internal.FileMetadata, options *archive.TarOption
 		}
 	}
 	return nil
+}
+
+func mapToSlice(inputMap map[uint32]struct{}) []uint32 {
+	var out []uint32
+	for value := range inputMap {
+		out = append(out, value)
+	}
+	return out
+}
+
+func collectIDs(entries []internal.FileMetadata) ([]uint32, []uint32) {
+	uids := make(map[uint32]struct{})
+	gids := make(map[uint32]struct{})
+	for _, entry := range entries {
+		uids[uint32(entry.UID)] = struct{}{}
+		gids[uint32(entry.GID)] = struct{}{}
+	}
+	return mapToSlice(uids), mapToSlice(gids)
 }
 
 type originFile struct {
@@ -483,7 +462,7 @@ func (o *originFile) OpenFile() (io.ReadCloser, error) {
 // setFileAttrs sets the file attributes for file given metadata
 func setFileAttrs(dirfd int, file *os.File, mode os.FileMode, metadata *internal.FileMetadata, options *archive.TarOptions, usePath bool) error {
 	if file == nil || file.Fd() < 0 {
-		return errors.Errorf("invalid file")
+		return errors.New("invalid file")
 	}
 	fd := int(file.Fd())
 
@@ -581,7 +560,7 @@ func openFileUnderRootFallback(dirfd int, name string, flags uint64, mode os.Fil
 
 	hasNoFollow := (flags & unix.O_NOFOLLOW) != 0
 
-	fd := -1
+	var fd int
 	// If O_NOFOLLOW is specified in the flags, then resolve only the parent directory and use the
 	// last component as the path to openat().
 	if hasNoFollow {
@@ -624,7 +603,7 @@ func openFileUnderRootFallback(dirfd int, name string, flags uint64, mode os.Fil
 	// Add an additional check to make sure the opened fd is inside the rootfs
 	if !strings.HasPrefix(target, targetRoot) {
 		unix.Close(fd)
-		return -1, fmt.Errorf("error while resolving %q.  It resolves outside the root directory", name)
+		return -1, fmt.Errorf("while resolving %q.  It resolves outside the root directory", name)
 	}
 
 	return fd, err
@@ -633,7 +612,7 @@ func openFileUnderRootFallback(dirfd int, name string, flags uint64, mode os.Fil
 func openFileUnderRootOpenat2(dirfd int, name string, flags uint64, mode os.FileMode) (int, error) {
 	how := unix.OpenHow{
 		Flags:   flags,
-		Mode:    uint64(mode & 07777),
+		Mode:    uint64(mode & 0o7777),
 		Resolve: unix.RESOLVE_IN_ROOT,
 	}
 	return unix.Openat2(dirfd, name, &how)
@@ -711,7 +690,7 @@ func openOrCreateDirUnderRoot(name string, dirfd int, mode os.FileMode) (*os.Fil
 
 			baseName := filepath.Base(name)
 
-			if err2 := unix.Mkdirat(int(pDir.Fd()), baseName, 0755); err2 != nil {
+			if err2 := unix.Mkdirat(int(pDir.Fd()), baseName, 0o755); err2 != nil {
 				return nil, err
 			}
 
@@ -734,7 +713,7 @@ func (c *chunkedDiffer) prepareCompressedStreamToFile(partCompression compressed
 		// Only the missing chunk in the requested part refers to a hole.
 		// The received data must be discarded.
 		limitReader := io.LimitReader(from, mf.CompressedSize)
-		_, err := io.CopyBuffer(ioutil.Discard, limitReader, c.copyBuffer)
+		_, err := io.CopyBuffer(io.Discard, limitReader, c.copyBuffer)
 		return fileTypeHole, err
 	case partCompression == fileTypeZstdChunked:
 		c.rawReader = io.LimitReader(from, mf.CompressedSize)
@@ -918,19 +897,22 @@ func (c *chunkedDiffer) storeMissingFiles(streams chan io.ReadCloser, errs chan 
 			case p := <-streams:
 				part = p
 			case err := <-errs:
+				if err == nil {
+					return errors.New("not enough data returned from the server")
+				}
 				return err
 			}
 			if part == nil {
-				return errors.Errorf("invalid stream returned")
+				return errors.New("invalid stream returned")
 			}
 		default:
-			return errors.Errorf("internal error: missing part misses both local and remote data stream")
+			return errors.New("internal error: missing part misses both local and remote data stream")
 		}
 
 		for _, mf := range missingPart.Chunks {
 			if mf.Gap > 0 {
 				limitReader := io.LimitReader(part, mf.Gap)
-				_, err := io.CopyBuffer(ioutil.Discard, limitReader, c.copyBuffer)
+				_, err := io.CopyBuffer(io.Discard, limitReader, c.copyBuffer)
 				if err != nil {
 					Err = err
 					goto exit
@@ -939,7 +921,7 @@ func (c *chunkedDiffer) storeMissingFiles(streams chan io.ReadCloser, errs chan 
 			}
 
 			if mf.File.Name == "" {
-				Err = errors.Errorf("file name empty")
+				Err = errors.New("file name empty")
 				goto exit
 			}
 
@@ -980,7 +962,7 @@ func (c *chunkedDiffer) storeMissingFiles(streams chan io.ReadCloser, errs chan 
 				goto exit
 			}
 			if c.rawReader != nil {
-				if _, err := io.CopyBuffer(ioutil.Discard, c.rawReader, c.copyBuffer); err != nil {
+				if _, err := io.CopyBuffer(io.Discard, c.rawReader, c.copyBuffer); err != nil {
 					Err = err
 					goto exit
 				}
@@ -1081,11 +1063,17 @@ func mergeMissingChunks(missingParts []missingPart, target int) []missingPart {
 
 func (c *chunkedDiffer) retrieveMissingFiles(dest string, dirfd int, missingParts []missingPart, options *archive.TarOptions) error {
 	var chunksToRequest []ImageSourceChunk
-	for _, c := range missingParts {
-		if c.OriginFile == nil && !c.Hole {
-			chunksToRequest = append(chunksToRequest, *c.SourceChunk)
+
+	calculateChunksToRequest := func() {
+		chunksToRequest = []ImageSourceChunk{}
+		for _, c := range missingParts {
+			if c.OriginFile == nil && !c.Hole {
+				chunksToRequest = append(chunksToRequest, *c.SourceChunk)
+			}
 		}
 	}
+
+	calculateChunksToRequest()
 
 	// There are some missing files.  Prepare a multirange request for the missing chunks.
 	var streams chan io.ReadCloser
@@ -1106,6 +1094,7 @@ func (c *chunkedDiffer) retrieveMissingFiles(dest string, dirfd int, missingPart
 
 			// Merge more chunks to request
 			missingParts = mergeMissingChunks(missingParts, requested/2)
+			calculateChunksToRequest()
 			continue
 		}
 		return err
@@ -1248,7 +1237,7 @@ func (d whiteoutHandler) Mknod(path string, mode uint32, dev int) error {
 
 func checkChownErr(err error, name string, uid, gid int) error {
 	if errors.Is(err, syscall.EINVAL) {
-		return fmt.Errorf("potentially insufficient UIDs or GIDs available in user namespace (requested %d:%d for %s): Check /etc/subuid and /etc/subgid if configured locally: %w", uid, gid, name, err)
+		return fmt.Errorf(`potentially insufficient UIDs or GIDs available in user namespace (requested %d:%d for %s): Check /etc/subuid and /etc/subgid if configured locally and run "podman system migrate": %w`, uid, gid, name, err)
 	}
 	return err
 }
@@ -1287,10 +1276,9 @@ func parseBooleanPullOption(storeOpts *storage.StoreOptions, name string, def bo
 }
 
 type findAndCopyFileOptions struct {
-	useHardLinks    bool
-	enableHostDedup bool
-	ostreeRepos     []string
-	options         *archive.TarOptions
+	useHardLinks bool
+	ostreeRepos  []string
+	options      *archive.TarOptions
 }
 
 func (c *chunkedDiffer) findAndCopyFile(dirfd int, r *internal.FileMetadata, copyOptions *findAndCopyFileOptions, mode os.FileMode) (bool, error) {
@@ -1326,18 +1314,6 @@ func (c *chunkedDiffer) findAndCopyFile(dirfd int, r *internal.FileMetadata, cop
 		return true, nil
 	}
 
-	if copyOptions.enableHostDedup {
-		found, dstFile, _, err = findFileOnTheHost(r, dirfd, copyOptions.useHardLinks, c.copyBuffer)
-		if err != nil {
-			return false, err
-		}
-		if found {
-			if err := finalizeFile(dstFile); err != nil {
-				return false, err
-			}
-			return true, nil
-		}
-	}
 	return false, nil
 }
 
@@ -1349,12 +1325,13 @@ func (c *chunkedDiffer) ApplyDiff(dest string, options *archive.TarOptions) (gra
 		}
 	}()
 
-	bigData := map[string][]byte{
-		bigDataKey: c.manifest,
-	}
 	output := graphdriver.DriverWithDifferOutput{
-		Differ:  c,
-		BigData: bigData,
+		Differ:   c,
+		TarSplit: c.tarSplit,
+		BigData: map[string][]byte{
+			bigDataKey: c.manifest,
+		},
+		TOCDigest: c.tocDigest,
 	}
 
 	storeOpts, err := types.DefaultStoreOptionsAutoDetectUID()
@@ -1365,8 +1342,6 @@ func (c *chunkedDiffer) ApplyDiff(dest string, options *archive.TarOptions) (gra
 	if !parseBooleanPullOption(&storeOpts, "enable_partial_images", false) {
 		return output, errors.New("enable_partial_images not configured")
 	}
-
-	enableHostDedup := parseBooleanPullOption(&storeOpts, "enable_host_deduplication", false)
 
 	// When the hard links deduplication is used, file attributes are ignored because setting them
 	// modifies the source file as well.
@@ -1385,10 +1360,15 @@ func (c *chunkedDiffer) ApplyDiff(dest string, options *archive.TarOptions) (gra
 
 	var missingParts []missingPart
 
-	mergedEntries, err := c.mergeTocEntries(c.fileType, toc.Entries)
+	output.UIDs, output.GIDs = collectIDs(toc.Entries)
+
+	mergedEntries, totalSize, err := c.mergeTocEntries(c.fileType, toc.Entries)
 	if err != nil {
 		return output, err
 	}
+
+	output.Size = totalSize
+
 	if err := maybeDoIDRemap(mergedEntries, options); err != nil {
 		return output, err
 	}
@@ -1416,10 +1396,9 @@ func (c *chunkedDiffer) ApplyDiff(dest string, options *archive.TarOptions) (gra
 	missingPartsSize, totalChunksSize := int64(0), int64(0)
 
 	copyOptions := findAndCopyFileOptions{
-		useHardLinks:    useHardLinks,
-		enableHostDedup: enableHostDedup,
-		ostreeRepos:     ostreeRepos,
-		options:         options,
+		useHardLinks: useHardLinks,
+		ostreeRepos:  ostreeRepos,
+		options:      options,
 	}
 
 	type copyFileJob struct {
@@ -1462,7 +1441,7 @@ func (c *chunkedDiffer) ApplyDiff(dest string, options *archive.TarOptions) (gra
 	filesToWaitFor := 0
 	for i, r := range mergedEntries {
 		if options.ForceMask != nil {
-			value := fmt.Sprintf("%d:%d:0%o", r.UID, r.GID, r.Mode&07777)
+			value := fmt.Sprintf("%d:%d:0%o", r.UID, r.GID, r.Mode&0o7777)
 			r.Xattrs[containersOverrideXattr] = base64.StdEncoding.EncodeToString([]byte(value))
 			r.Mode = int64(*options.ForceMask)
 		}
@@ -1575,6 +1554,8 @@ func (c *chunkedDiffer) ApplyDiff(dest string, options *archive.TarOptions) (gra
 	wg.Wait()
 
 	for _, res := range copyResults[:filesToWaitFor] {
+		r := &mergedEntries[res.index]
+
 		if res.err != nil {
 			return output, res.err
 		}
@@ -1583,8 +1564,6 @@ func (c *chunkedDiffer) ApplyDiff(dest string, options *archive.TarOptions) (gra
 		if res.found {
 			continue
 		}
-
-		r := &mergedEntries[res.index]
 
 		missingPartsSize += r.Size
 
@@ -1657,6 +1636,7 @@ func (c *chunkedDiffer) ApplyDiff(dest string, options *archive.TarOptions) (gra
 	if totalChunksSize > 0 {
 		logrus.Debugf("Missing %d bytes out of %d (%.2f %%)", missingPartsSize, totalChunksSize, float32(missingPartsSize*100.0)/float32(totalChunksSize))
 	}
+
 	return output, nil
 }
 
@@ -1673,7 +1653,9 @@ func mustSkipFile(fileType compressedFileType, e internal.FileMetadata) bool {
 	return false
 }
 
-func (c *chunkedDiffer) mergeTocEntries(fileType compressedFileType, entries []internal.FileMetadata) ([]internal.FileMetadata, error) {
+func (c *chunkedDiffer) mergeTocEntries(fileType compressedFileType, entries []internal.FileMetadata) ([]internal.FileMetadata, int64, error) {
+	var totalFilesSize int64
+
 	countNextChunks := func(start int) int {
 		count := 0
 		for _, e := range entries[start:] {
@@ -1702,8 +1684,11 @@ func (c *chunkedDiffer) mergeTocEntries(fileType compressedFileType, entries []i
 		if mustSkipFile(fileType, e) {
 			continue
 		}
+
+		totalFilesSize += e.Size
+
 		if e.Type == TypeChunk {
-			return nil, fmt.Errorf("chunk type without a regular file")
+			return nil, -1, fmt.Errorf("chunk type without a regular file")
 		}
 
 		if e.Type == TypeReg {
@@ -1736,7 +1721,7 @@ func (c *chunkedDiffer) mergeTocEntries(fileType compressedFileType, entries []i
 			lastChunkOffset = mergedEntries[i].Chunks[j].Offset
 		}
 	}
-	return mergedEntries, nil
+	return mergedEntries, totalFilesSize, nil
 }
 
 // validateChunkChecksum checks if the file at $root/$path[offset:chunk.ChunkSize] has the
