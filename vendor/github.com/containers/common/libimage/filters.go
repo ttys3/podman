@@ -11,7 +11,6 @@ import (
 	filtersPkg "github.com/containers/common/pkg/filters"
 	"github.com/containers/common/pkg/timetype"
 	"github.com/containers/image/v5/docker/reference"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -74,14 +73,15 @@ func (r *Runtime) filterImages(ctx context.Context, images []*Image, options *Li
 
 // compileImageFilters creates `filterFunc`s for the specified filters.  The
 // required format is `key=value` with the following supported keys:
-//           after, since, before, containers, dangling, id, label, readonly, reference, intermediate
+//
+//	after, since, before, containers, dangling, id, label, readonly, reference, intermediate
 func (r *Runtime) compileImageFilters(ctx context.Context, options *ListImagesOptions) (map[string][]filterFunc, error) {
 	logrus.Tracef("Parsing image filters %s", options.Filters)
 
 	var tree *layerTree
 	getTree := func() (*layerTree, error) {
 		if tree == nil {
-			t, err := r.layerTree()
+			t, err := r.layerTree(nil)
 			if err != nil {
 				return nil, err
 			}
@@ -95,9 +95,15 @@ func (r *Runtime) compileImageFilters(ctx context.Context, options *ListImagesOp
 	for _, f := range options.Filters {
 		var key, value string
 		var filter filterFunc
-		split := strings.SplitN(f, "=", 2)
-		if len(split) != 2 {
-			return nil, errors.Errorf("invalid image filter %q: must be in the format %q", f, "filter=value")
+		negate := false
+		split := strings.SplitN(f, "!=", 2)
+		if len(split) == 2 {
+			negate = true
+		} else {
+			split = strings.SplitN(f, "=", 2)
+			if len(split) != 2 {
+				return nil, fmt.Errorf("invalid image filter %q: must be in the format %q", f, "filter=value or filter!=value")
+			}
 		}
 
 		key = split[0]
@@ -140,6 +146,9 @@ func (r *Runtime) compileImageFilters(ctx context.Context, options *ListImagesOp
 		case "id":
 			filter = filterID(value)
 
+		case "digest":
+			filter = filterDigest(value)
+
 		case "intermediate":
 			intermediate, err := r.bool(duplicate, key, value)
 			if err != nil {
@@ -154,7 +163,6 @@ func (r *Runtime) compileImageFilters(ctx context.Context, options *ListImagesOp
 
 		case "label":
 			filter = filterLabel(ctx, value)
-
 		case "readonly":
 			readOnly, err := r.bool(duplicate, key, value)
 			if err != nil {
@@ -170,7 +178,7 @@ func (r *Runtime) compileImageFilters(ctx context.Context, options *ListImagesOp
 			filter = filterManifest(ctx, manifest)
 
 		case "reference":
-			filter = filterReferences(value)
+			filter = filterReferences(r, value)
 
 		case "until":
 			until, err := r.until(value)
@@ -180,7 +188,10 @@ func (r *Runtime) compileImageFilters(ctx context.Context, options *ListImagesOp
 			filter = filterBefore(until)
 
 		default:
-			return nil, errors.Errorf("unsupported image filter %q", key)
+			return nil, fmt.Errorf("unsupported image filter %q", key)
+		}
+		if negate {
+			filter = negateFilter(filter)
 		}
 		filters[key] = append(filters[key], filter)
 	}
@@ -188,9 +199,16 @@ func (r *Runtime) compileImageFilters(ctx context.Context, options *ListImagesOp
 	return filters, nil
 }
 
+func negateFilter(f filterFunc) filterFunc {
+	return func(img *Image) (bool, error) {
+		b, err := f(img)
+		return !b, err
+	}
+}
+
 func (r *Runtime) containers(duplicate map[string]string, key, value string, externalFunc IsExternalContainerFunc) error {
 	if exists, ok := duplicate[key]; ok && exists != value {
-		return errors.Errorf("specifying %q filter more than once with different values is not supported", key)
+		return fmt.Errorf("specifying %q filter more than once with different values is not supported", key)
 	}
 	duplicate[key] = value
 	switch value {
@@ -221,19 +239,19 @@ func (r *Runtime) until(value string) (time.Time, error) {
 func (r *Runtime) time(key, value string) (*Image, error) {
 	img, _, err := r.LookupImage(value, nil)
 	if err != nil {
-		return nil, errors.Wrapf(err, "could not find local image for filter filter %q=%q", key, value)
+		return nil, fmt.Errorf("could not find local image for filter filter %q=%q: %w", key, value, err)
 	}
 	return img, nil
 }
 
 func (r *Runtime) bool(duplicate map[string]string, key, value string) (bool, error) {
 	if exists, ok := duplicate[key]; ok && exists != value {
-		return false, errors.Errorf("specifying %q filter more than once with different values is not supported", key)
+		return false, fmt.Errorf("specifying %q filter more than once with different values is not supported", key)
 	}
 	duplicate[key] = value
 	set, err := strconv.ParseBool(value)
 	if err != nil {
-		return false, errors.Wrapf(err, "non-boolean value %q for %s filter", key, value)
+		return false, fmt.Errorf("non-boolean value %q for %s filter: %w", key, value, err)
 	}
 	return set, nil
 }
@@ -250,8 +268,15 @@ func filterManifest(ctx context.Context, value bool) filterFunc {
 }
 
 // filterReferences creates a reference filter for matching the specified value.
-func filterReferences(value string) filterFunc {
+func filterReferences(r *Runtime, value string) filterFunc {
+	lookedUp, _, _ := r.LookupImage(value, nil)
 	return func(img *Image) (bool, error) {
+		if lookedUp != nil {
+			if lookedUp.ID() == img.ID() {
+				return true, nil
+			}
+		}
+
 		refs, err := img.NamesReferences()
 		if err != nil {
 			return false, err
@@ -288,6 +313,7 @@ func filterReferences(value string) filterFunc {
 				}
 			}
 		}
+
 		return false, nil
 	}
 }
@@ -365,6 +391,15 @@ func filterDangling(ctx context.Context, value bool, tree *layerTree) filterFunc
 func filterID(value string) filterFunc {
 	return func(img *Image) (bool, error) {
 		return img.ID() == value, nil
+	}
+}
+
+// filterDigest creates a digest filter for matching the specified value.
+func filterDigest(value string) filterFunc {
+	// TODO: return an error if value is not a digest
+	// if _, err := digest.Parse(value); err != nil {...}
+	return func(img *Image) (bool, error) {
+		return img.hasDigest(value), nil
 	}
 }
 
