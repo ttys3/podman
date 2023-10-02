@@ -1,18 +1,18 @@
 package secrets
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"time"
 
 	"github.com/containers/common/pkg/secrets/filedriver"
 	"github.com/containers/common/pkg/secrets/passdriver"
 	"github.com/containers/common/pkg/secrets/shelldriver"
 	"github.com/containers/storage/pkg/lockfile"
+	"github.com/containers/storage/pkg/regexp"
 	"github.com/containers/storage/pkg/stringid"
-	"github.com/pkg/errors"
 )
 
 // maxSecretSize is the max size for secret data - 512kB
@@ -49,15 +49,19 @@ var errDataSize = errors.New("secret data must be larger than 0 and less than 51
 var secretsFile = "secrets.json"
 
 // secretNameRegexp matches valid secret names
-// Allowed: 64 [a-zA-Z0-9-_.] characters, and the start and end character must be [a-zA-Z0-9]
-var secretNameRegexp = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+// Allowed: 253 characters, excluding ,/=\0
+var secretNameRegexp = regexp.Delayed("^[^,/=\000]+$")
 
 // SecretsManager holds information on handling secrets
+//
+// revive does not like the name because the package is already called secrets
+//
+//nolint:revive
 type SecretsManager struct {
 	// secretsPath is the path to the db file where secrets are stored
 	secretsDBPath string
 	// lockfile is the locker for the secrets file
-	lockfile lockfile.Locker
+	lockfile *lockfile.LockFile
 	// db is an in-memory cache of the database of secrets
 	db *db
 }
@@ -68,13 +72,17 @@ type Secret struct {
 	Name string `json:"name"`
 	// ID is the unique secret ID
 	ID string `json:"id"`
+	// Labels are labels on the secret
+	Labels map[string]string `json:"labels,omitempty"`
 	// Metadata stores other metadata on the secret
 	Metadata map[string]string `json:"metadata,omitempty"`
 	// CreatedAt is when the secret was created
 	CreatedAt time.Time `json:"createdAt"`
+	// UpdatedAt is when the secret was updated
+	UpdatedAt time.Time `json:"updatedAt"`
 	// Driver is the driver used to store secret data
 	Driver string `json:"driver"`
-	// DriverOptions is other metadata needed to use the driver
+	// DriverOptions are extra options used to run this driver
 	DriverOptions map[string]string `json:"driverOptions"`
 }
 
@@ -82,6 +90,10 @@ type Secret struct {
 // The driver stores the actual bytes of secret data, as opposed to
 // the secret metadata.
 // Currently only the unencrypted filedriver is implemented.
+//
+// revive does not like the name because the package is already called secrets
+//
+//nolint:revive
 type SecretsDriver interface {
 	// List lists all secret ids in the secrets data store
 	List() ([]string, error)
@@ -93,20 +105,32 @@ type SecretsDriver interface {
 	Delete(id string) error
 }
 
+// StoreOptions are optional metadata fields that can be set when storing a new secret
+type StoreOptions struct {
+	// DriverOptions are extra options used to run this driver
+	DriverOpts map[string]string
+	// Metadata stores extra metadata on the secret
+	Metadata map[string]string
+	// Labels are labels on the secret
+	Labels map[string]string
+	// Replace existing secret
+	Replace bool
+}
+
 // NewManager creates a new secrets manager
 // rootPath is the directory where the secrets data file resides
 func NewManager(rootPath string) (*SecretsManager, error) {
 	manager := new(SecretsManager)
 
 	if !filepath.IsAbs(rootPath) {
-		return nil, errors.Wrapf(errInvalidPath, "path must be absolute: %s", rootPath)
+		return nil, fmt.Errorf("path must be absolute: %s: %w", rootPath, errInvalidPath)
 	}
 	// the lockfile functions require that the rootPath dir is executable
-	if err := os.MkdirAll(rootPath, 0700); err != nil {
+	if err := os.MkdirAll(rootPath, 0o700); err != nil {
 		return nil, err
 	}
 
-	lock, err := lockfile.GetLockfile(filepath.Join(rootPath, "secrets.lock"))
+	lock, err := lockfile.GetLockFile(filepath.Join(rootPath, "secrets.lock"))
 	if err != nil {
 		return nil, err
 	}
@@ -119,10 +143,25 @@ func NewManager(rootPath string) (*SecretsManager, error) {
 	return manager, nil
 }
 
+func (s *SecretsManager) newID() (string, error) {
+	for {
+		newID := stringid.GenerateNonCryptoID()
+		// GenerateNonCryptoID() gives 64 characters, so we truncate to correct length
+		newID = newID[0:secretIDLength]
+		_, err := s.lookupSecret(newID)
+		if err != nil {
+			if errors.Is(err, ErrNoSuchSecret) {
+				return newID, nil
+			}
+			return "", err
+		}
+	}
+}
+
 // Store takes a name, creates a secret and stores the secret metadata and the secret payload.
 // It returns a generated ID that is associated with the secret.
 // The max size for secret data is 512kB.
-func (s *SecretsManager) Store(name string, data []byte, driverType string, driverOpts map[string]string) (string, error) {
+func (s *SecretsManager) Store(name string, data []byte, driverType string, options StoreOptions) (string, error) {
 	err := validateSecretName(name)
 	if err != nil {
 		return "", err
@@ -131,7 +170,7 @@ func (s *SecretsManager) Store(name string, data []byte, driverType string, driv
 	if !(len(data) > 0 && len(data) < maxSecretSize) {
 		return "", errDataSize
 	}
-
+	var secr *Secret
 	s.lockfile.Lock()
 	defer s.lockfile.Unlock()
 
@@ -139,45 +178,66 @@ func (s *SecretsManager) Store(name string, data []byte, driverType string, driv
 	if err != nil {
 		return "", err
 	}
+
 	if exist {
-		return "", errors.Wrapf(errSecretNameInUse, name)
+		if !options.Replace {
+			return "", fmt.Errorf("%s: %w", name, errSecretNameInUse)
+		}
+		secr, err = s.lookupSecret(name)
+		if err != nil {
+			return "", err
+		}
+		secr.UpdatedAt = time.Now()
+	} else {
+		secr = new(Secret)
+		secr.Name = name
+		secr.CreatedAt = time.Now()
+		secr.UpdatedAt = secr.CreatedAt
 	}
 
-	secr := new(Secret)
-	secr.Name = name
-
-	for {
-		newID := stringid.GenerateNonCryptoID()
-		// GenerateNonCryptoID() gives 64 characters, so we truncate to correct length
-		newID = newID[0:secretIDLength]
-		_, err := s.lookupSecret(newID)
-		if err != nil {
-			if errors.Cause(err) == ErrNoSuchSecret {
-				secr.ID = newID
-				break
-			} else {
-				return "", err
-			}
-		}
+	if options.Metadata == nil {
+		options.Metadata = make(map[string]string)
+	}
+	if options.Labels == nil {
+		options.Labels = make(map[string]string)
+	}
+	if options.DriverOpts == nil {
+		options.DriverOpts = make(map[string]string)
 	}
 
 	secr.Driver = driverType
-	secr.Metadata = make(map[string]string)
-	secr.CreatedAt = time.Now()
-	secr.DriverOptions = driverOpts
+	secr.Metadata = options.Metadata
+	secr.DriverOptions = options.DriverOpts
+	secr.Labels = options.Labels
 
-	driver, err := getDriver(driverType, driverOpts)
+	driver, err := getDriver(driverType, options.DriverOpts)
 	if err != nil {
 		return "", err
 	}
+
+	if options.Replace {
+		if err := driver.Delete(secr.ID); err != nil {
+			return "", fmt.Errorf("deleting secret %s: %w", secr.ID, err)
+		}
+
+		if err := s.delete(secr.ID); err != nil {
+			return "", fmt.Errorf("deleting secret %s: %w", secr.ID, err)
+		}
+	}
+
+	secr.ID, err = s.newID()
+	if err != nil {
+		return "", err
+	}
+
 	err = driver.Store(secr.ID, data)
 	if err != nil {
-		return "", errors.Wrapf(err, "error creating secret %s", name)
+		return "", fmt.Errorf("creating secret %s: %w", name, err)
 	}
 
 	err = s.store(secr)
 	if err != nil {
-		return "", errors.Wrapf(err, "error creating secret %s", name)
+		return "", fmt.Errorf("creating secret %s: %w", name, err)
 	}
 
 	return secr.ID, nil
@@ -186,11 +246,6 @@ func (s *SecretsManager) Store(name string, data []byte, driverType string, driv
 // Delete removes all secret metadata and secret data associated with the specified secret.
 // Delete takes a name, ID, or partial ID.
 func (s *SecretsManager) Delete(nameOrID string) (string, error) {
-	err := validateSecretName(nameOrID)
-	if err != nil {
-		return "", err
-	}
-
 	s.lockfile.Lock()
 	defer s.lockfile.Unlock()
 
@@ -207,12 +262,12 @@ func (s *SecretsManager) Delete(nameOrID string) (string, error) {
 
 	err = driver.Delete(secretID)
 	if err != nil {
-		return "", errors.Wrapf(err, "error deleting secret %s", nameOrID)
+		return "", fmt.Errorf("deleting secret %s: %w", nameOrID, err)
 	}
 
 	err = s.delete(secretID)
 	if err != nil {
-		return "", errors.Wrapf(err, "error deleting secret %s", nameOrID)
+		return "", fmt.Errorf("deleting secret %s: %w", nameOrID, err)
 	}
 	return secretID, nil
 }
@@ -234,10 +289,9 @@ func (s *SecretsManager) List() ([]Secret, error) {
 	if err != nil {
 		return nil, err
 	}
-	var ls []Secret
+	ls := make([]Secret, 0, len(secrets))
 	for _, v := range secrets {
 		ls = append(ls, v)
-
 	}
 	return ls, nil
 }
@@ -265,8 +319,10 @@ func (s *SecretsManager) LookupSecretData(nameOrID string) (*Secret, []byte, err
 
 // validateSecretName checks if the secret name is valid.
 func validateSecretName(name string) error {
-	if !secretNameRegexp.MatchString(name) || len(name) > 64 || strings.HasSuffix(name, "-") || strings.HasSuffix(name, ".") {
-		return errors.Wrapf(errInvalidSecretName, "only 64 [a-zA-Z0-9-_.] characters allowed, and the start and end character must be [a-zA-Z0-9]: %s", name)
+	if len(name) == 0 ||
+		len(name) > 253 ||
+		!secretNameRegexp.MatchString(name) {
+		return fmt.Errorf("secret name %q can not include '=', '/', ',', or the '\\0' (NULL) and be between 1 and 253 characters: %w", name, errInvalidSecretName)
 	}
 	return nil
 }
@@ -277,9 +333,8 @@ func getDriver(name string, opts map[string]string) (SecretsDriver, error) {
 	case "file":
 		if path, ok := opts["path"]; ok {
 			return filedriver.NewDriver(path)
-		} else {
-			return nil, errors.Wrap(errInvalidDriverOpt, "need path for filedriver")
 		}
+		return nil, fmt.Errorf("need path for filedriver: %w", errInvalidDriverOpt)
 	case "pass":
 		return passdriver.NewDriver(opts)
 	case "shell":
