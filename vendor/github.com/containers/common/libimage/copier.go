@@ -2,21 +2,25 @@ package libimage
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/containers/common/libimage/manifests"
 	"github.com/containers/common/pkg/config"
 	"github.com/containers/common/pkg/retry"
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/pkg/compression"
 	"github.com/containers/image/v5/signature"
+	"github.com/containers/image/v5/signature/signer"
 	storageTransport "github.com/containers/image/v5/storage"
 	"github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -26,8 +30,10 @@ const (
 )
 
 // LookupReferenceFunc return an image reference based on the specified one.
-// This can be used to pass custom blob caches to the copy operation.
-type LookupReferenceFunc func(ref types.ImageReference) (types.ImageReference, error)
+// The returned reference can return custom ImageSource or ImageDestination
+// objects which intercept or filter blobs, manifests, and signatures as
+// they are read and written.
+type LookupReferenceFunc = manifests.LookupReferenceFunc
 
 // CopyOptions allow for customizing image-copy operations.
 type CopyOptions struct {
@@ -44,6 +50,10 @@ type CopyOptions struct {
 	CompressionFormat *compression.Algorithm
 	// CompressionLevel specifies what compression level is used
 	CompressionLevel *int
+	// ForceCompressionFormat ensures that the compression algorithm set in
+	// CompressionFormat is used exclusively, and blobs of other compression
+	// algorithms are not reused.
+	ForceCompressionFormat bool
 
 	// containers-auth.json(5) file to use when authenticating against
 	// container registries.
@@ -95,9 +105,19 @@ type CopyOptions struct {
 	PolicyAllowStorage bool
 	// SignaturePolicyPath to overwrite the default one.
 	SignaturePolicyPath string
+	// If non-empty, asks for signatures to be added during the copy
+	// using the provided signers.
+	Signers []*signer.Signer
 	// If non-empty, asks for a signature to be added during the copy, and
 	// specifies a key ID.
 	SignBy string
+	// If non-empty, passphrase to use when signing with the key ID from SignBy.
+	SignPassphrase string
+	// If non-empty, asks for a signature to be added during the copy, using
+	// a sigstore private key file at the provided path.
+	SignBySigstorePrivateKeyFile string
+	// Passphrase to use when signing with SignBySigstorePrivateKeyFile.
+	SignSigstorePrivateKeyPassphrase []byte
 	// Remove any pre-existing signatures. SignBy will still add a new
 	// signature.
 	RemoveSignatures bool
@@ -131,69 +151,70 @@ type CopyOptions struct {
 
 	// Additional tags when creating or copying a docker-archive.
 	dockerArchiveAdditionalTags []reference.NamedTagged
+
+	// If set it points to a NOTIFY_SOCKET the copier will use to extend
+	// the systemd timeout while copying.
+	extendTimeoutSocket string
 }
 
 // copier is an internal helper to conveniently copy images.
 type copier struct {
-	imageCopyOptions copy.Options
-	retryOptions     retry.RetryOptions
-	systemContext    *types.SystemContext
-	policyContext    *signature.PolicyContext
+	extendTimeoutSocket string
+	imageCopyOptions    copy.Options
+	retryOptions        retry.Options
+	systemContext       *types.SystemContext
+	policyContext       *signature.PolicyContext
 
 	sourceLookup      LookupReferenceFunc
 	destinationLookup LookupReferenceFunc
 }
 
-var (
-	// storageAllowedPolicyScopes overrides the policy for local storage
-	// to ensure that we can read images from it.
-	storageAllowedPolicyScopes = signature.PolicyTransportScopes{
-		"": []signature.PolicyRequirement{
-			signature.NewPRInsecureAcceptAnything(),
-		},
+// storageAllowedPolicyScopes overrides the policy for local storage
+// to ensure that we can read images from it.
+var storageAllowedPolicyScopes = signature.PolicyTransportScopes{
+	"": []signature.PolicyRequirement{
+		signature.NewPRInsecureAcceptAnything(),
+	},
+}
+
+// getDockerAuthConfig extracts a docker auth config. Returns nil if
+// no credentials are set.
+func getDockerAuthConfig(name, passwd, creds, idToken string) (*types.DockerAuthConfig, error) {
+	numCredsSources := 0
+
+	if name != "" {
+		numCredsSources++
 	}
-)
+	if creds != "" {
+		name, passwd, _ = strings.Cut(creds, ":")
+		numCredsSources++
+	}
+	if idToken != "" {
+		numCredsSources++
+	}
+	authConf := &types.DockerAuthConfig{
+		Username:      name,
+		Password:      passwd,
+		IdentityToken: idToken,
+	}
 
-// getDockerAuthConfig extracts a docker auth config from the CopyOptions.  Returns
-// nil if no credentials are set.
-func (options *CopyOptions) getDockerAuthConfig() (*types.DockerAuthConfig, error) {
-	authConf := &types.DockerAuthConfig{IdentityToken: options.IdentityToken}
-
-	if options.Username != "" {
-		if options.Credentials != "" {
-			return nil, errors.New("username/password cannot be used with credentials")
-		}
-		authConf.Username = options.Username
-		authConf.Password = options.Password
+	switch numCredsSources {
+	case 0:
+		// Return nil if there is no credential source.
+		return nil, nil
+	case 1:
 		return authConf, nil
+	default:
+		// Cannot use the multiple credential sources.
+		return nil, errors.New("cannot use the multiple credential sources")
 	}
-
-	if options.Credentials != "" {
-		split := strings.SplitN(options.Credentials, ":", 2)
-		switch len(split) {
-		case 1:
-			authConf.Username = split[0]
-		default:
-			authConf.Username = split[0]
-			authConf.Password = split[1]
-		}
-		return authConf, nil
-	}
-
-	// We should return nil unless a token was set.  That's especially
-	// useful for Podman's remote API.
-	if options.IdentityToken != "" {
-		return authConf, nil
-	}
-
-	return nil, nil
 }
 
 // newCopier creates a copier.  Note that fields in options *may* overwrite the
 // counterparts of the specified system context.  Please make sure to call
 // `(*copier).close()`.
 func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
-	c := copier{}
+	c := copier{extendTimeoutSocket: options.extendTimeoutSocket}
 	c.systemContext = r.systemContextCopy()
 
 	if options.SourceLookupReferenceFunc != nil {
@@ -224,7 +245,7 @@ func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
 		c.systemContext.SignaturePolicyPath = options.SignaturePolicyPath
 	}
 
-	dockerAuthConfig, err := options.getDockerAuthConfig()
+	dockerAuthConfig, err := getDockerAuthConfig(options.Username, options.Password, options.Credentials, options.IdentityToken)
 	if err != nil {
 		return nil, err
 	}
@@ -283,6 +304,7 @@ func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
 		c.imageCopyOptions.ProgressInterval = time.Second
 	}
 
+	c.imageCopyOptions.ForceCompressionFormat = options.ForceCompressionFormat
 	c.imageCopyOptions.ForceManifestMIMEType = options.ManifestMIMEType
 	c.imageCopyOptions.SourceCtx = c.systemContext
 	c.imageCopyOptions.DestinationCtx = c.systemContext
@@ -290,7 +312,11 @@ func (r *Runtime) newCopier(options *CopyOptions) (*copier, error) {
 	c.imageCopyOptions.OciEncryptLayers = options.OciEncryptLayers
 	c.imageCopyOptions.OciDecryptConfig = options.OciDecryptConfig
 	c.imageCopyOptions.RemoveSignatures = options.RemoveSignatures
+	c.imageCopyOptions.Signers = options.Signers
 	c.imageCopyOptions.SignBy = options.SignBy
+	c.imageCopyOptions.SignPassphrase = options.SignPassphrase
+	c.imageCopyOptions.SignBySigstorePrivateKeyFile = options.SignBySigstorePrivateKeyFile
+	c.imageCopyOptions.SignSigstorePrivateKeyPassphrase = options.SignSigstorePrivateKeyPassphrase
 	c.imageCopyOptions.ReportWriter = options.Writer
 
 	defaultContainerConfig, err := config.Default()
@@ -312,6 +338,61 @@ func (c *copier) close() error {
 // manifest which may be used for digest computation.
 func (c *copier) copy(ctx context.Context, source, destination types.ImageReference) ([]byte, error) {
 	logrus.Debugf("Copying source image %s to destination image %s", source.StringWithinTransport(), destination.StringWithinTransport())
+
+	// Avoid running out of time when running inside a systemd unit by
+	// regularly increasing the timeout.
+	if c.extendTimeoutSocket != "" {
+		socketAddr := &net.UnixAddr{
+			Name: c.extendTimeoutSocket,
+			Net:  "unixgram",
+		}
+		conn, err := net.DialUnix(socketAddr.Net, nil, socketAddr)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+
+		numExtensions := 10
+		extension := 30 * time.Second
+		timerFrequency := 25 * time.Second // Fire the timer at a higher frequency to avoid a race
+		timer := time.NewTicker(timerFrequency)
+		socketCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		defer timer.Stop()
+
+		fmt.Fprintf(c.imageCopyOptions.ReportWriter, "Pulling image %s inside systemd: setting pull timeout to %s\n", source.DockerReference(), time.Duration(numExtensions)*extension)
+
+		// From `man systemd.service(5)`:
+		//
+		// "If a service of Type=notify/Type=notify-reload sends "EXTEND_TIMEOUT_USEC=...", this may cause
+		// the start time to be extended beyond TimeoutStartSec=. The first receipt of this message must
+		// occur before TimeoutStartSec= is exceeded, and once the start time has extended beyond
+		// TimeoutStartSec=, the service manager will allow the service to continue to start, provided the
+		// service repeats "EXTEND_TIMEOUT_USEC=..."  within the interval specified until the service startup
+		// status is finished by "READY=1"."
+		extendValue := []byte(fmt.Sprintf("EXTEND_TIMEOUT_USEC=%d", extension.Microseconds()))
+		extendTimeout := func() {
+			if _, err := conn.Write(extendValue); err != nil {
+				logrus.Errorf("Increasing EXTEND_TIMEOUT_USEC failed: %v", err)
+			}
+			numExtensions--
+		}
+
+		extendTimeout()
+		go func() {
+			for {
+				select {
+				case <-socketCtx.Done():
+					return
+				case <-timer.C:
+					if numExtensions == 0 {
+						return
+					}
+					extendTimeout()
+				}
+			}
+		}()
+	}
 
 	var err error
 
@@ -342,12 +423,12 @@ func (c *copier) copy(ctx context.Context, source, destination types.ImageRefere
 	// Sanity checks for Buildah.
 	if sourceInsecure != nil && *sourceInsecure {
 		if c.systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
-			return nil, errors.Errorf("can't require tls verification on an insecured registry")
+			return nil, fmt.Errorf("can't require tls verification on an insecured registry")
 		}
 	}
 	if destinationInsecure != nil && *destinationInsecure {
 		if c.systemContext.DockerInsecureSkipTLSVerify == types.OptionalBoolFalse {
-			return nil, errors.Errorf("can't require tls verification on an insecured registry")
+			return nil, fmt.Errorf("can't require tls verification on an insecured registry")
 		}
 	}
 
@@ -369,7 +450,7 @@ func (c *copier) copy(ctx context.Context, source, destination types.ImageRefere
 		}
 		return err
 	}
-	return returnManifest, retry.RetryIfNecessary(ctx, f, &c.retryOptions)
+	return returnManifest, retry.IfNecessary(ctx, f, &c.retryOptions)
 }
 
 // checkRegistrySourcesAllows checks the $BUILD_REGISTRY_SOURCES environment
@@ -401,7 +482,7 @@ func checkRegistrySourcesAllows(dest types.ImageReference) (insecure *bool, err 
 		AllowedRegistries  []string `json:"allowedRegistries,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(registrySources), &sources); err != nil {
-		return nil, errors.Wrapf(err, "error parsing $BUILD_REGISTRY_SOURCES (%q) as JSON", registrySources)
+		return nil, fmt.Errorf("parsing $BUILD_REGISTRY_SOURCES (%q) as JSON: %w", registrySources, err)
 	}
 	blocked := false
 	if len(sources.BlockedRegistries) > 0 {
@@ -412,7 +493,7 @@ func checkRegistrySourcesAllows(dest types.ImageReference) (insecure *bool, err 
 		}
 	}
 	if blocked {
-		return nil, errors.Errorf("registry %q denied by policy: it is in the blocked registries list (%s)", reference.Domain(dref), registrySources)
+		return nil, fmt.Errorf("registry %q denied by policy: it is in the blocked registries list (%s)", reference.Domain(dref), registrySources)
 	}
 	allowed := true
 	if len(sources.AllowedRegistries) > 0 {
@@ -424,7 +505,7 @@ func checkRegistrySourcesAllows(dest types.ImageReference) (insecure *bool, err 
 		}
 	}
 	if !allowed {
-		return nil, errors.Errorf("registry %q denied by policy: not in allowed registries list (%s)", reference.Domain(dref), registrySources)
+		return nil, fmt.Errorf("registry %q denied by policy: not in allowed registries list (%s)", reference.Domain(dref), registrySources)
 	}
 
 	for _, inseureDomain := range sources.InsecureRegistries {

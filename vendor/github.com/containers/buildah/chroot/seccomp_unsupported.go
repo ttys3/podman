@@ -1,11 +1,15 @@
-// +build !linux !seccomp
+//go:build (!linux && !freebsd) || !seccomp
+// +build !linux,!freebsd !seccomp
 
 package chroot
 
 import (
+	"errors"
+
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/pkg/errors"
 )
+
+const seccompAvailable = false
 
 func setSeccomp(spec *specs.Spec) error {
 	if spec.Linux.Seccomp != nil {
