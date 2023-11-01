@@ -42,12 +42,12 @@ require (
 	github.com/json-iterator/go v1.1.12
 	github.com/mattn/go-isatty v0.0.14
 	github.com/moby/term v0.0.0-20210619224110-3f7ff695adc6
-	github.com/mrunalp/fileutils v0.5.0
+	github.com/mrunalp/fileutils v0.5.1
 	github.com/onsi/ginkgo v1.16.5
 	github.com/onsi/gomega v1.18.1
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.0.3-0.20220114050600-8b9d41f48198
-	github.com/opencontainers/runc v1.1.0
+	github.com/opencontainers/runc v1.1.10
 	github.com/opencontainers/runtime-spec v1.0.3-0.20211214071223-8958f93039ab
 	github.com/opencontainers/runtime-tools v0.9.1-0.20220110225228-7e2d60f1e41f
 	github.com/opencontainers/selinux v1.10.0
@@ -65,9 +65,9 @@ require (
 	github.com/vishvananda/netlink v1.1.1-0.20220115184804-dd687eb2f2d4
 	go.etcd.io/bbolt v1.3.6
 	golang.org/x/crypto v0.0.0-20220112180741-5e0467b6c7ce
-	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20220114195835-da31bd327af9
-	golang.org/x/text v0.3.7
+	golang.org/x/sync v0.1.0
+	golang.org/x/sys v0.6.0
+	golang.org/x/text v0.8.0
 	google.golang.org/protobuf v1.27.1
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b
 	k8s.io/api v0.22.4
