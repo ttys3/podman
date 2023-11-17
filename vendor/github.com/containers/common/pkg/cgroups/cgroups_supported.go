@@ -1,19 +1,22 @@
+//go:build linux
 // +build linux
 
 package cgroups
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/pkg/errors"
+	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
+	"github.com/godbus/dbus/v5"
 	"golang.org/x/sys/unix"
 )
 
@@ -34,6 +37,13 @@ func IsCgroup2UnifiedMode() (bool, error) {
 		}
 	})
 	return isUnified, isUnifiedErr
+}
+
+// UserConnection returns an user connection to D-BUS
+func UserConnection(uid int) (*systemdDbus.Conn, error) {
+	return systemdDbus.NewConnection(func() (*dbus.Conn, error) {
+		return dbusAuthConnection(uid, dbus.SessionBusPrivateNoAutoStartup)
+	})
 }
 
 // UserOwnsCurrentSystemdCgroup checks whether the current EUID owns the
@@ -78,7 +88,7 @@ func UserOwnsCurrentSystemdCgroup() (bool, error) {
 		}
 		s := st.Sys()
 		if s == nil {
-			return false, fmt.Errorf("error stat cgroup path %s", cgroupPath)
+			return false, fmt.Errorf("stat cgroup path %s", cgroupPath)
 		}
 
 		if int(s.(*syscall.Stat_t).Uid) != uid {
@@ -86,7 +96,7 @@ func UserOwnsCurrentSystemdCgroup() (bool, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return false, errors.Wrapf(err, "parsing file /proc/self/cgroup")
+		return false, fmt.Errorf("parsing file /proc/self/cgroup: %w", err)
 	}
 	return true, nil
 }
@@ -95,10 +105,26 @@ func UserOwnsCurrentSystemdCgroup() (bool, error) {
 // It differs from os.RemoveAll as it doesn't attempt to unlink files.
 // On cgroupfs we are allowed only to rmdir empty directories.
 func rmDirRecursively(path string) error {
-	if err := os.Remove(path); err == nil || os.IsNotExist(err) {
+	killProcesses := func(signal syscall.Signal) {
+		if signal == unix.SIGKILL {
+			if err := os.WriteFile(filepath.Join(path, "cgroup.kill"), []byte("1"), 0o600); err == nil {
+				return
+			}
+		}
+		// kill all the processes that are still part of the cgroup
+		if procs, err := os.ReadFile(filepath.Join(path, "cgroup.procs")); err == nil {
+			for _, pidS := range strings.Split(string(procs), "\n") {
+				if pid, err := strconv.Atoi(pidS); err == nil {
+					_ = unix.Kill(pid, signal)
+				}
+			}
+		}
+	}
+
+	if err := os.Remove(path); err == nil || errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	entries, err := ioutil.ReadDir(path)
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		return err
 	}
@@ -113,17 +139,25 @@ func rmDirRecursively(path string) error {
 	attempts := 0
 	for {
 		err := os.Remove(path)
-		if err == nil || os.IsNotExist(err) {
+		if err == nil || errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		if errors.Is(err, unix.EBUSY) {
-			// attempt up to 5 seconds if the cgroup is busy
-			if attempts < 500 {
+			// send a SIGTERM after 3 second
+			if attempts == 300 {
+				killProcesses(unix.SIGTERM)
+			}
+			// send SIGKILL after 8 seconds
+			if attempts == 800 {
+				killProcesses(unix.SIGKILL)
+			}
+			// give up after 10 seconds
+			if attempts < 1000 {
 				time.Sleep(time.Millisecond * 10)
 				attempts++
 				continue
 			}
 		}
-		return errors.Wrapf(err, "remove %s", path)
+		return fmt.Errorf("remove %s: %w", path, err)
 	}
 }
